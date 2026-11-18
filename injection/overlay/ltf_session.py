@@ -287,6 +287,7 @@ class LtfSession:
     start_log_tail: Optional[LtkLogTail] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     ended: bool = False
+    manager_path: Optional[Path] = None
 
     @property
     def confirmed_on(self) -> Set[LibraryId]:
@@ -411,6 +412,7 @@ class LtfHost:
             launched,
             saved_mod_ids=manifest_ltk_ids(self.saved_mods_dir()),
             start_log_tail=LtkLogTail(LtkLogTail.log_dir()),
+            manager_path=manager,
         )
         self._ready_library(session)
         shutil.rmtree(self.staging_root(), ignore_errors=True)

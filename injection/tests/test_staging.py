@@ -1,3 +1,4 @@
+import json
 import shutil
 import tempfile
 import threading
@@ -344,6 +345,95 @@ class OverlayStagingTests(LtfSessionTestCase):
 
         session = self.overlay._early_session
         self.assertGreaterEqual(session["staged_after_s"], 2.0)
+
+
+class RejectedSkinStagingTests(LtfSessionTestCase):
+    SKIN = "120041-test"
+    NAME = "Test Hecarim skin"
+    INCIDENT = "2026-11-18T10-22-37"
+
+    def setUp(self):
+        super().setUp()
+        self.game_exe = self.game / "League of Legends.exe"
+        self.game_exe.write_bytes(b"game build 1")
+        (self.root / "ltk-manager.exe").write_bytes(b"manager build 1")
+
+    def reject_in_game(self, *, ambiguous=False):
+        self.make_mod(self.SKIN, self.NAME)
+        self.overlay.open_staging()
+        self.assertTrue(self.overlay.stage_mods(self.mods, [self.SKIN]))
+        entry = self.bridge.library_entries[0]
+        wad = "hecarim.wad.client"
+        detail = f"{wad}: base-skin check: skin0 skeleton is one of hecarim's other skins' meshes"
+        suspects = [{"modId": entry["id"], "displayName": self.NAME, "reason": "rejected"}]
+        if ambiguous:
+            suspects.append({"modId": "second-writer", "displayName": "Another package", "reason": "rejected"})
+        incidents = self.ltk_logs.parent / "incidents"
+        incidents.mkdir()
+        (incidents / f"{self.INCIDENT}.json").write_text(json.dumps({
+            "id": self.INCIDENT, "overlay": "disabled", "overlayDetail": detail,
+            "verdict": {"kind": "skinhack-detected", "subject": wad}, "suspects": suspects,
+        }), encoding="utf-8")
+        (self.ltk_logs / "ltk-manager.2026-11-18.log").write_text(
+            f"overlay verification failed, disabling overlay: wad data/final/champions/{detail}\n"
+            f"Incident recorded: Skinhack Detection id={self.INCIDENT} verdict=SkinhackDetected\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.overlay.mk_run_overlay([self.SKIN], stop_callback=lambda: True), 0)
+
+    def test_a_rejected_package_is_skipped_but_other_mods_stay_staged(self):
+        self.reject_in_game()
+        self.assertIn(self.NAME, self.report_issue.call_args.args[2])
+        self.make_mod(self.SKIN, self.NAME)
+        label = self.make_mod("ROSE-LoadingName", "Loading screen name")
+        extra = self.make_mod("extra", "Other mod")
+        selection = [self.SKIN, label, extra]
+
+        self.overlay.open_staging()
+        self.assertTrue(self.overlay.stage_mods(self.mods, selection))
+        self.assertEqual([entry["displayName"] for entry in self.bridge.library_entries], ["Other mod"])
+        self.assertEqual(self.overlay.mk_run_overlay(selection, stop_callback=lambda: True), 0)
+
+        self.assertEqual(self.bridge.command_names().count("import"), 1)
+        self.assertEqual(self.bridge.command_names().count("start_patcher"), 1)
+        self.assertEqual(self.reported_codes(), ["LTF_FAILED", "LTK_SKIN_SKIPPED"])
+        self.assertIn(self.NAME, self.report_issue.call_args.args[2])
+
+    def test_skipping_the_only_skin_clears_the_earlier_staged_overlay(self):
+        self.reject_in_game()
+        self.make_mod(self.SKIN, self.NAME)
+        earlier = self.make_mod()
+        self.overlay.open_staging()
+        self.assertTrue(self.overlay.stage_mods(self.mods, [earlier]))
+
+        self.assertTrue(self.overlay.stage_mods(self.mods, [self.SKIN]))
+        self.assertEqual(self.bridge.library_entries, [])
+        self.assertIn("stop_patcher", self.bridge.command_names())
+        self.assertEqual(self.overlay.mk_run_overlay([self.SKIN]), 0)
+
+        self.assertEqual(self.bridge.command_names().count("start_patcher"), 1)
+        self.assertEqual(self.bridge.command_names().count("import"), 1)
+        self.assertIn("League will run without Rose's overlay", self.report_issue.call_args.args[2])
+
+    def test_an_updated_package_or_game_build_can_be_tried_again(self):
+        self.reject_in_game()
+        self.make_mod(self.SKIN, self.NAME, wad=b"updated package")
+        self.overlay.open_staging()
+        self.assertTrue(self.overlay.stage_mods(self.mods, [self.SKIN]))
+        self.assertEqual(self.bridge.command_names().count("import"), 1)
+
+        (self.mods / self.SKIN / "WAD" / "Aatrox.wad.client").write_bytes(b"wad")
+        self.assertTrue(self.overlay.stage_mods(self.mods, [self.SKIN]))
+        self.assertEqual(self.bridge.library_entries, [])
+
+        self.game_exe.write_bytes(b"new League build")
+        self.assertTrue(self.overlay.stage_mods(self.mods, [self.SKIN]))
+        self.assertEqual(self.bridge.command_names().count("import"), 2)
+        self.overlay.discard_early_patcher()
+
+    def test_a_wad_with_multiple_suspects_does_not_block_an_individual_package(self):
+        self.reject_in_game(ambiguous=True)
+        self.assertEqual(self.state()["rejected_skins"], {})
 
 
 class LtkLogReadingTests(LtfSessionTestCase):

@@ -5604,6 +5604,13 @@
           };
         }
 
+        if (code === 'LTK_SKIN_SKIPPED') {
+          return {
+            title: t('Rose skipped a rejected skin package'),
+            details: [e?.detail, e?.hint].filter(Boolean),
+          };
+        }
+
         if (code === 'LTF_FAILED') {
           const detail = String(e?.detail || '').trim();
           // Why it failed (ltk_failure_cause in overlay_manager.py): what to

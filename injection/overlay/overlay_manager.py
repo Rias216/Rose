@@ -23,11 +23,13 @@ except ImportError:
 from injection.game.reconnect import kill_game, reconnect_to_game
 from utils.core.logging import get_logger, log_event
 from utils.core.issue_reporter import report_issue
-from ..tools.bridge import BridgeCommandError, BridgeUnavailable
+from ..loadingname.loading_name import MOD_FOLDER as LOADING_NAME_MOD
 from ..mods.fantome import fantome_display_name, write_fantome_zip
 from ..mods.fingerprint import mod_fingerprint
 from ..mods.ltk_ref import split_mod_names
+from ..mods.mod_facts import stamp_of
 from ..mods.mod_files import is_mod_archive
+from ..tools.bridge import BridgeCommandError, BridgeUnavailable
 from utils.core.modpkg import is_modpkg
 from utils.system.process_list import running_processes
 from .ltf_report import (
@@ -38,6 +40,7 @@ from .ltf_report import (
     NOT_ATTACHED_MESSAGE,
     OVERLAY_DISABLED_MESSAGE,
     SIGNATURE_FAILURE_MESSAGE,
+    SKIPPED_SKINS_PREFIX,
     cdp_unreachable,
     cdp_unreachable_reason,
     report_ltf_failure,
@@ -50,7 +53,7 @@ from .ltf_session import (
     LtfSession,
     archive_for_ltk,
 )
-from .ltk_data import LtkLogTail, entry_name
+from .ltk_data import LtkLogTail, entry_name, read_skin_rejection
 from config import (
     GAME_EXECUTABLE_NAMES,
     PROCESS_MONITOR_SLEEP_S,
@@ -230,6 +233,7 @@ class OverlayManager:
             "ltk_error": None,  # LTK Manager's first patcher ERROR line
             "staged_after_s": None,  # pick -> patcher start, for the staged mods
             "library_snapshot": None,
+            "without_overlay": False,  # the only selected skin packages were rejected
             "attach_logged": False,
             "stopper": None,
             "state": None,
@@ -367,6 +371,22 @@ class OverlayManager:
         """Whether the session was stopped (by Rose, the user, or its end)."""
         return bool(session["ltf"].ended) or self._stopped_by_rose()
 
+    def _skin_check_context(self, ltf: LtfSession) -> Optional[list]:
+        """Identify the local game and LTK builds without reading their contents."""
+        if self.game_dir is None or ltf.manager_path is None:
+            return None
+        manager = stamp_of(ltf.manager_path)
+        if manager is None:
+            return None
+        log_dir = ltf.start_log_tail.directory if ltf.start_log_tail is not None else None
+        delivery = stamp_of(log_dir.parent / "patcher" / "delivery.json") if log_dir is not None else None
+        for name in GAME_EXECUTABLE_NAMES:
+            game_path = self.game_dir / name
+            game = stamp_of(game_path)
+            if game is not None:
+                return [str(game_path), game, str(ltf.manager_path), manager, delivery]
+        return None
+
     def _install_mods(self, session: dict, mod_names: List[str], folder_dir: Optional[Path] = None,
                       report: bool = True, stopped: Optional[Callable[[], bool]] = None,
                       archives: Optional[Dict[str, Path]] = None) -> bool:
@@ -393,8 +413,12 @@ class OverlayManager:
         if stopped is None:
             stopped = lambda: self._session_stopped(session)
         session["library_snapshot"] = None
+        session["without_overlay"] = False
 
         files, ltk_ids = split_mod_names(mod_names)
+        context = self._skin_check_context(ltf) if files else None
+        rejected = self.host.journal.rejected_skins(context) if context is not None else {}
+        skipped = []
         wanted = []
         for name in files:
             folder = folder_dir / name
@@ -402,9 +426,18 @@ class OverlayManager:
                 log.error(f"[INJECT] Mod not found: {folder}")
                 continue
             try:
-                wanted.append((name, folder, mod_fingerprint(folder)))
+                fingerprint = mod_fingerprint(folder)
             except OSError as e:
                 log.error(f"[INJECT] Could not read the mod folder {folder}: {e}")
+                continue
+            if fingerprint in rejected:
+                display_name = " ".join((fantome_display_name(folder) or name).split())
+                skipped.append(f"{display_name} ({rejected[fingerprint]})")
+                continue
+            wanted.append((name, folder, fingerprint))
+        if skipped:
+            # The generated loading name may still name the omitted skin.
+            wanted = [mod for mod in wanted if mod[0] != LOADING_NAME_MOD]
         switch_on, switch_off = self.host.switches.changes(ltf, ltk_ids)
         shared_library_read: Optional[list] = None
         if switch_on:
@@ -413,7 +446,8 @@ class OverlayManager:
             except (BridgeUnavailable, BridgeCommandError) as e:
                 return self._saved_mods_failed(e, report and not stopped())
             switch_on = self.host.switches.listed(switch_on, shared_library_read)
-        if not wanted and not switch_on and not (set(ltk_ids) & ltf.confirmed_on):
+        empty = not wanted and not switch_on and not (set(ltk_ids) & ltf.confirmed_on)
+        if empty and not skipped:
             log.error("[INJECT] No mods could be installed into LTK Manager")
             if report and not stopped():
                 report_issue(
@@ -424,6 +458,17 @@ class OverlayManager:
                     hint=f"Retry; if it keeps happening, report it with rose_*.log. {LTF_LOGS_HINT}",
                 )
             return False
+        if skipped:
+            session["without_overlay"] = empty
+            message = f"{SKIPPED_SKINS_PREFIX} {', '.join(skipped)}."
+            if empty:
+                message += " League will run without Rose's overlay."
+            log.info(f"[INJECT] {message}")
+            if report and not stopped():
+                report_issue(
+                    "LTK_SKIN_SKIPPED", "warning", message,
+                    hint="Rose will retry after a package, League, or LTK update, or after 24 hours.",
+                )
 
         kept, to_import = set(), []
         for name, folder, fingerprint in wanted:
@@ -438,14 +483,18 @@ class OverlayManager:
                 kept.add(match)
         unwanted = [mod_id for mod_id in ltf.imports if mod_id not in kept]
         reuse, parked = self._reuse_parked(to_import)
-        if not to_import and not unwanted and not reuse and not switch_on and not switch_off:
-            return True  # the library already holds exactly these mods
+        if not any((to_import, unwanted, reuse, switch_on, switch_off)):
+            if not (empty and session["patcher_running"]):
+                return True  # the library already holds exactly these mods
 
         if session["patcher_running"]:
-            log.warning(
-                "[INJECT] The mods differ from the ones staged during the countdown - restarting the "
-                "LTK patcher (it only overlays a game the client starts after that)"
-            )
+            if empty:
+                log.info("[INJECT] Stopping the staged LTK patcher because there are no mods to apply")
+            else:
+                log.warning(
+                    "[INJECT] The mods differ from the ones staged during the countdown - restarting the "
+                    "LTK patcher (it only overlays a game the client starts after that)"
+                )
             self._stop_patcher(session)
         if unwanted and not self.host.remove_unwanted(ltf, unwanted):
             return False
@@ -606,6 +655,10 @@ class OverlayManager:
         session["scan_started_at"] = None
         session["staged_after_s"] = None
         session["ltk_error"] = None
+        session["ltk_disabled"] = None
+        session["ltk_incident"] = None
+        session["disabled_reported"] = False
+        session["incident_reported"] = False
         # A game the client creates while this build runs is held at once
         session["hold_done"] = False
         self._start_hold_watch(session)
@@ -737,6 +790,9 @@ class OverlayManager:
                 return False
             if session["ltf"].ended or stopped():
                 return False
+            if session["without_overlay"]:
+                self._release_held_game(session)
+                return True
             self._disable_other_mods(session)
             restarted = not session["patcher_running"]
             if restarted and not self._start_patcher(session, report=False):
@@ -871,7 +927,7 @@ class OverlayManager:
 
             # The extracted files were packed into LTK Manager's own archives
             self._wipe_mods_dir()
-            if self._session_stopped(session):
+            if session["without_overlay"] or self._session_stopped(session):
                 self._end_session(session)
                 return 0
             self._disable_other_mods(session)
@@ -908,6 +964,8 @@ class OverlayManager:
         """A game the client created before the patcher's scan started cannot
         get the overlay: restart it now rather than let it load first."""
         self._read_ltk_log(session)
+        if session.get("ltk_disabled"):
+            return
         scan = session.get("scan_started_at")
         game = self._running_game()
         if scan is None or game is None:
@@ -1417,6 +1475,18 @@ class OverlayManager:
         the new game then."""
         return session.get("restarted_at") is not None
 
+    def _remember_skin_rejection(self, session: dict, incident_id: str) -> Optional[str]:
+        tail = session["ltk_log"]
+        rejection = read_skin_rejection(tail.directory, incident_id) if tail is not None else None
+        if rejection is None:
+            return None
+        ltf = session["ltf"]
+        tracked = ltf.imports.get(rejection.mod_id)
+        context = self._skin_check_context(ltf) if tracked and tracked.source_digest else None
+        if context is not None and self.host.journal.remember_rejected_skin(context, tracked.source_digest, rejection.wad):
+            log.info(f"[INJECT] Will skip this version of {rejection.name} after LTK rejected {rejection.wad}")
+        return rejection.name
+
     def _check_patcher_verdict(self, session: dict, value: Optional[dict] = None) -> None:
         """Log the patcher reaching the game, and report it joining too late
         (the DLL then stays inert: the game runs without the overlay)."""
@@ -1429,7 +1499,7 @@ class OverlayManager:
         if session["ltk_attached"] and not session["attach_logged"]:
             session["attach_logged"] = True
             log.info("[INJECT] The LTK patcher attached to the game")
-        if session["ltk_late"] and not session["late_join_reported"]:
+        if session["ltk_late"] and not session["late_join_reported"] and not session["ltk_disabled"]:
             log.warning("[INJECT] The LTK patcher joined the game too late")
             restarted = self._restart_missed_game(session, self._running_game())
         else:
@@ -1487,19 +1557,23 @@ class OverlayManager:
             if not self._stopped_by_rose():
                 report_ltf_failure(f"{NOT_ATTACHED_MESSAGE} ({not_attached})")
         disabled = session.get("ltk_disabled")
-        if disabled and not session.get("disabled_reported"):
-            session["disabled_reported"] = True
-            log.error(f"[INJECT] LTK Manager's integrity check disabled the overlay this game: {disabled}")
-            report_ltf_failure(f"LTK Manager {OVERLAY_DISABLED_MESSAGE} ({disabled})")
         incident = session.get("ltk_incident")
+        rejected_skin = None
         if incident and not session.get("incident_reported"):
             session["incident_reported"] = True
             title, incident_id, verdict = incident
             where = f"{LTK_INCIDENTS_DIR}\\{incident_id}.json"
             log.error(f"[INJECT] LTK Manager recorded an incident: {title} ({verdict}), see {where}")
+            if verdict == "SkinhackDetected":
+                rejected_skin = self._remember_skin_rejection(session, incident_id)
             incident_repeats_a_report = disabled or session.get("not_attached_reported")
             if not incident_repeats_a_report:
                 report_ltf_failure(f"LTK Manager recorded an incident after the game: {title} ({verdict}; {where})")
+        if disabled and not session.get("disabled_reported"):
+            session["disabled_reported"] = True
+            log.error(f"[INJECT] LTK Manager's integrity check disabled the overlay this game: {disabled}")
+            source = f". LTK Manager identified {rejected_skin} as the source." if rejected_skin else ""
+            report_ltf_failure(f"LTK Manager {OVERLAY_DISABLED_MESSAGE} ({disabled}){source}")
         slow = session.get("ltk_slow_mod_check_s")
         if slow is not None and not session.get("slow_mod_check_reported"):
             session["slow_mod_check_reported"] = True
@@ -1604,7 +1678,7 @@ class OverlayManager:
             "import_duration": time.time() - install_start,
             "timestamp": time.time(),
         }
-        if not installed:
+        if not installed or session["without_overlay"]:
             self._end_session(session)
             return 1
 

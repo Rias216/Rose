@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional
@@ -170,6 +171,45 @@ def entry_archive(entry: Mapping) -> Optional[Path]:
 
 def entry_name(entry: Mapping) -> str:
     return str(entry.get("displayName") or entry.get("name") or entry.get("id"))
+
+
+@dataclass(frozen=True)
+class SkinRejection:
+    mod_id: str
+    name: str
+    wad: str
+
+
+def read_skin_rejection(log_dir: Optional[Path], incident_id: str) -> Optional[SkinRejection]:
+    """An identified base-skin rejection from this patcher's incident report."""
+    if log_dir is None or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", incident_id):
+        return None
+    try:
+        path = log_dir.parent / "incidents" / f"{incident_id}.json"
+        incident = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(incident, dict) or incident.get("id") != incident_id or incident.get("overlay") != "disabled":
+        return None
+    verdict = incident.get("verdict")
+    if not isinstance(verdict, dict) or verdict.get("kind") != "skinhack-detected":
+        return None
+    target, _, detail = str(incident.get("overlayDetail") or "").partition(": ")
+    wad = target.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if (not wad.endswith(".wad.client") or wad != str(verdict.get("subject") or "").casefold()
+            or not detail.casefold().startswith("base-skin check: ")):
+        return None
+    suspects = incident.get("suspects")
+    if not isinstance(suspects, list):
+        return None
+    rejected = [s for s in suspects if isinstance(s, dict) and s.get("reason") == "rejected"]
+    if len(rejected) != 1:
+        return None  # A merged WAD can have several writers.
+    mod_id = rejected[0].get("modId")
+    if not isinstance(mod_id, str) or not mod_id:
+        return None
+    name = " ".join(str(rejected[0].get("displayName") or mod_id).split())
+    return SkinRejection(mod_id, name, wad)
 
 
 class LtkLogTail:

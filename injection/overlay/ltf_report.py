@@ -19,6 +19,7 @@ OVERLAY_REFUSED_MESSAGE = "host verification failed"
 SIGNATURE_FAILURE_MESSAGE = "Windows could not verify the signature of LTK Manager's files"
 NOT_ATTACHED_MESSAGE = "LTK Manager's patcher never got into the game"
 OVERLAY_DISABLED_MESSAGE = "disabled the overlay"
+SKIPPED_SKINS_PREFIX = "Rose skipped packages that LTK Manager rejected."
 BRIDGE_CDP_FAILURE_MARKER = "cdp unavailable"
 CDP_UNREACHABLE_REASON = "Rose's bridge could not reach LTK Manager's built-in browser (CDP unavailable or timed out)"
 # Tauri rejecting a command LTK Manager does not declare ("Command

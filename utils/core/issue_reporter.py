@@ -39,6 +39,7 @@ _ALLOWED_CODES = {
     'LTF_MISSING',            # Rose's LTF bridge files (ltk_launcher.exe + LeagueToolFlop.dll) are missing
     'LTK_MANAGER_MISSING',    # LTK Manager, which Rose drives through the bridge, is not installed
     'LTF_FAILED',             # The LTF session (bridge or LTK patcher) reported an error
+    'LTK_SKIN_SKIPPED',       # A previous LTK base-skin rejection was omitted from the overlay
     'LTK_HEAVY_BUILTINS',     # LTK Manager's built-in mods put every champion's archive into the overlay
     'LTK_SLOW_MOD_CHECK',     # LTK Manager's automatic mod check took minutes while the game loaded
     'LTK_ELEVATED',           # LTK Manager's own programs are set to run as administrator (error 740)

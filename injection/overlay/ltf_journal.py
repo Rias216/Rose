@@ -3,6 +3,7 @@
 
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, TypedDict
 
@@ -24,7 +25,10 @@ class KeptRecord(TypedDict):
 
 
 _SHARED_STATE_FILE_LOCK = threading.Lock()
-_LAYOUT_KEYS = ("installed", "disabled", "manager", "kept", "switched")
+_LAYOUT_KEYS = ("installed", "disabled", "manager", "kept", "switched", "rejected_skins")
+# LTK can deliver a newer patcher when it next builds an overlay. Give the
+# same package another chance even if nothing on disk has changed yet.
+REJECTED_SKIN_RETRY_S = 24 * 60 * 60
 
 
 def _upgrade_first_layout(document: dict) -> dict:
@@ -52,6 +56,7 @@ class LtfJournal:
         manager = document.get("manager")
         kept = document.get("kept")
         switched = document.get("switched")
+        rejected = document.get("rejected_skins")
         kept_for_next_game: Dict[LibraryId, KeptRecord] = {
             str(mod_id): record for mod_id, record in kept.items()
             if isinstance(record, dict) and record.get("fingerprint") and record.get("source")
@@ -65,6 +70,7 @@ class LtfJournal:
             "manager": manager if isinstance(manager, dict) else None,
             "kept": kept_for_next_game,
             "switched": switched_on,
+            "rejected_skins": rejected if isinstance(rejected, dict) else {},
         }
 
     def update(self, change: Callable[[dict], None]) -> bool:
@@ -86,6 +92,28 @@ class LtfJournal:
         """The saved mods left in LTK Manager, turned off."""
         with _SHARED_STATE_FILE_LOCK:
             return self.read()["kept"]
+
+    def rejected_skins(self, context: list) -> Dict[str, str]:
+        """Recently rejected source fingerprints and their WADs for these builds."""
+        with _SHARED_STATE_FILE_LOCK:
+            cache = self.read()["rejected_skins"]
+        if cache.get("context") != context or not isinstance(cache.get("packages"), dict):
+            return {}
+        now = time.time()
+        return {
+            fingerprint: record["wad"] for fingerprint, record in cache["packages"].items()
+            if isinstance(record, dict) and isinstance(record.get("wad"), str)
+            and isinstance(record.get("at"), (int, float)) and 0 <= now - record["at"] < REJECTED_SKIN_RETRY_S
+        }
+
+    def remember_rejected_skin(self, context: list, fingerprint: str, wad: str) -> bool:
+        def remember(state):
+            cache = state["rejected_skins"]
+            if cache.get("context") != context or not isinstance(cache.get("packages"), dict):
+                cache = state["rejected_skins"] = {"context": context, "packages": {}}
+            cache["packages"][fingerprint] = {"wad": wad, "at": time.time()}
+
+        return self.update(remember)
 
     def forget_kept(self, mod_ids) -> None:
         """Drop these kept mods from the state file (gone from LTK Manager)."""

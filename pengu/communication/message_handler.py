@@ -26,7 +26,7 @@ from urllib.parse import quote
 from config import get_config_float, get_config_option, set_config_option
 from injection.mods.mod_source import LtkEntry, ModSource
 from injection.mods.storage import ModStorageService
-from injection.overlay.ltf_report import has_ltf_logs_hint, ltk_failure_cause
+from injection.overlay.ltf_report import SKIPPED_SKINS_PREFIX, has_ltf_logs_hint, ltk_failure_cause
 from injection.baseskin.library import stored_skin_rewrite
 from injection.overlay.ltk_library import LtkLibrary
 from utils.core.paths import get_user_data_dir, get_asset_path, open_folder_in_explorer
@@ -1025,6 +1025,13 @@ class MessageHandler:
                     }
 
                 # Category: LTF session (Rose's bridge driving LTK Manager).
+                if msg.startswith(SKIPPED_SKINS_PREFIX):
+                    return {
+                        'code': 'LTK_SKIN_SKIPPED',
+                        'text': msg,
+                        'detail': msg.removeprefix(SKIPPED_SKINS_PREFIX).strip(),
+                        'hint': fix.removeprefix('Fix:').strip(),
+                    }
                 # The overlay manager's import messages and hints are the
                 # markers: a mod name or an error text names nothing reliable
                 is_import_failure = (
